@@ -6,7 +6,6 @@
 #              prognostic gene selection using LASSO regression, and dynamic
 #              expression analysis of key pathways.
  
-
 library(dplyr)
 library(data.table)
 library(DESeq2)
@@ -879,3 +878,4 @@ plot_gene_expression(gene_symbol = "ITGB3", dds_class2 = dds_class2, dds_class4 
 # ==============================================================================
 
 ```
+
