@@ -1,4 +1,3 @@
-https://github.com/fzs1412/Dynamic-SIC-Subtypes-Omics.git
 # ==============================================================================
 # Project: Dynamic SIC Subtypes & Omics
 # Description: This script performs a comprehensive analysis of Sepsis-Induced
@@ -878,4 +877,5 @@ plot_gene_expression(gene_symbol = "ITGB3", dds_class2 = dds_class2, dds_class4 
 
 # End of script
 # ==============================================================================
+
 ```
