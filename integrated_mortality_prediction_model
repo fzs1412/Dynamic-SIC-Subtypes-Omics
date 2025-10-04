@@ -1,0 +1,257 @@
+# ==============================================================================
+# SCRIPT: 03_integrated_mortality_prediction_model.R
+#
+# PURPOSE:
+# This script integrates clinical, transcriptomic, and proteomic data to build
+# and evaluate machine learning models for predicting in-hospital mortality
+# in SIC patients. It uses LASSO for feature selection and compares different
+# data combinations using repeated cross-validation.
+#
+# INPUTS:
+# - coldata_path: Path to the clinical data CSV file.
+# - countdata_path: Path to the gene count matrix CSV file.
+# - olink_data_path: Path to the Olink long-format data CSV.
+# - sample_info_path: Path to the sample mapping information Excel file.
+#
+# OUTPUTS:
+# - CV_Model_Comparison_ROC_Final.pdf: A plot comparing the ROC curves of all
+#   evaluated models based on 10-fold repeated cross-validation.
+#
+# ==============================================================================
+
+# --- 0. Load Required Packages ---
+required_packages <- c(
+  "dplyr", "DESeq2", "glmnet", "pROC", "ggplot2", "caret",
+  "readxl", "tidyr", "tibble", "data.table"
+)
+for (pkg in required_packages) {
+  # For Bioconductor packages, use BiocManager
+  if (pkg %in% c("DESeq2") && !requireNamespace(pkg, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(pkg)
+  } else if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  library(pkg, character.only = TRUE)
+}
+cat("--- All required R packages have been loaded ---\n\n")
+
+# --- 1. Gene Expression Data Preparation ---
+cat("--- Module 1.1: Preparing Gene and Clinical Data for Mortality Prediction ---\n")
+
+# -- Define file paths (USER: PLEASE UPDATE THESE PATHS)
+coldata_path <- "d:/OneDrive/R/25SXFX/25SIC/guiji_coldata394.csv"
+countdata_path <- "D:/OneDrive/R/01sepsis/OMIX006457/OMIX006457-02.csv"
+olink_data_path <- "D:/OneDrive/R/01sepsis/OMIX006238-01.csv"
+sample_info_path <- "D:/OneDrive/R/01sepsis/Sample_Info.xlsxOLINK.xlsx"
+output_dir <- getwd()
+
+# -- Load and filter clinical data
+coldata_mortality <- read.csv(coldata_path, row.names = 1) %>%
+  filter(SIC >= 4) %>%
+  mutate(mort = as.factor(mort))
+
+# -- Load and process gene count data
+countdata <- read.csv(countdata_path, row.names = 1)
+countdata[is.na(countdata)] <- 0
+countdata_d1 <- countdata[, !grepl("d3$|d5$", colnames(countdata))]
+
+# -- Align gene and clinical data
+common_samples_gene <- intersect(colnames(countdata_d1), rownames(coldata_mortality))
+cat("Number of matched samples for genomics analysis:", length(common_samples_gene), "\n")
+countdata_aligned <- countdata_d1[, common_samples_gene]
+coldata_aligned <- coldata_mortality[common_samples_gene, ]
+
+# -- Gene ID Conversion
+gene_map <- data.frame(
+  ENSEMBL = gsub("\\|.*$", "", rownames(countdata_aligned)),
+  SYMBOL = gsub(".*\\|", "", rownames(countdata_aligned)),
+  stringsAsFactors = FALSE
+) %>% filter(SYMBOL != "" & !duplicated(ENSEMBL))
+rownames(countdata_aligned) <- gsub("\\|.*$", "", rownames(countdata_aligned))
+countdata_aligned <- countdata_aligned[rownames(countdata_aligned) %in% gene_map$ENSEMBL, ]
+
+# -- Prepare gene expression matrix for machine learning
+dds <- DESeqDataSetFromMatrix(countData = countdata_aligned, colData = coldata_aligned, design = ~ mort)
+dds <- DESeq(dds)
+vsd <- vst(dds, blind = FALSE)
+X_genes <- t(assay(vsd))
+
+# -- Remove genes with near-zero variance
+nzv <- nearZeroVar(X_genes, saveMetrics = TRUE)
+X_genes_filtered <- X_genes[, rownames(nzv[nzv$nzv == FALSE, ])]
+cat("Gene features remaining after removing near-zero variance genes:", ncol(X_genes_filtered), "\n\n")
+
+# --- 2. Proteomics Data Preparation ---
+cat("--- Module 2.1: Preparing Protein Data for Mortality Prediction ---\n")
+
+# -- Load Olink data and reshape
+olink_long_data <- read.delim(olink_data_path, sep=";", stringsAsFactors = FALSE)
+sample_info <- read_excel(sample_info_path)
+olink_long_data$SampleID <- trimws(as.character(olink_long_data$SampleID))
+sample_info$Sample <- trimws(as.character(sample_info$Sample))
+olink_mapped <- inner_join(olink_long_data, sample_info, by = c("SampleID" = "Sample"))
+
+olink_data_wide <- olink_mapped %>%
+  dplyr::select(Assay, SampleID.y, NPX) %>%
+  dplyr::filter(!is.na(SampleID.y) & !is.na(Assay) & !is.na(NPX)) %>%
+  dplyr::group_by(Assay, SampleID.y) %>%
+  dplyr::summarise(NPX = mean(NPX, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = SampleID.y, values_from = NPX) %>%
+  tibble::column_to_rownames("Assay")
+
+olink_data_d1 <- olink_data_wide[, !grepl("d3$|d5$", colnames(olink_data_wide))]
+
+# -- Align protein and clinical data
+common_samples_prot <- intersect(colnames(olink_data_d1), rownames(coldata_mortality))
+cat("Number of matched samples for proteomics analysis:", length(common_samples_prot), "\n")
+prot_matrix_aligned <- olink_data_d1[, common_samples_prot]
+X_prot_filtered <- t(prot_matrix_aligned)
+cat("Number of protein features:", ncol(X_prot_filtered), "\n\n")
+
+# --- 3. Machine Learning Model Building and Comparison ---
+
+# -- Module 3.1: Prepare Final Datasets for Cross-Validation
+cat("--- Module 3.1: Preparing final datasets for cross-validation ---\n")
+
+final_samples <- rownames(X_genes_filtered) # Use samples from genomics as the base
+y_outcome <- coldata_aligned[final_samples, "mort"]
+y_outcome_numeric <- ifelse(y_outcome == "1", 1, 0)
+
+# Prepare clinical data with imputation
+clinical_vars <- c("age", "sex", "SOFA", "lac", "crp", "wbc", "plt", "inr", "ddimer")
+X_clinical_full <- coldata_aligned[final_samples, clinical_vars]
+preProc_clinic <- preProcess(X_clinical_full, method = "medianImpute")
+X_clinical_final <- predict(preProc_clinic, X_clinical_full)
+
+# Prepare gene data
+X_genes_final <- X_genes_filtered[final_samples, ]
+
+# Prepare protein data with imputation
+X_prot_full <- X_prot_filtered[rownames(X_prot_filtered) %in% final_samples, ]
+X_prot_full <- X_prot_full[match(final_samples, rownames(X_prot_full)), ] # Ensure order
+preProc_prot <- preProcess(X_prot_full, method = "medianImpute")
+X_prot_final <- predict(preProc_prot, X_prot_full)
+
+cat("All final datasets prepared. Sample count:", length(final_samples), "\n\n")
+
+
+# -- Module 3.2: Perform LASSO Feature Selection on the Complete Dataset
+cat("--- Module 3.2: Performing LASSO feature selection ---\n")
+set.seed(42)
+
+# Select clinical variables
+cv_lasso_clinical <- cv.glmnet(as.matrix(X_clinical_final), y_outcome_numeric, family = "binomial", alpha = 1, type.measure = "auc")
+coeffs_clinical <- coef(cv_lasso_clinical, s = "lambda.min")
+sig_clinical <- rownames(coeffs_clinical)[which(coeffs_clinical != 0)][-1] # Exclude intercept
+cat("Clinical variables selected by LASSO (", length(sig_clinical), "):\n", paste(sig_clinical, collapse=", "), "\n")
+
+# Select genes (target ~10)
+target_n_genes <- 10
+cv_lasso_genes <- cv.glmnet(as.matrix(X_genes_final), y_outcome_numeric, family = "binomial", alpha = 1, type.measure = "auc")
+lambda_idx_genes <- which.min(abs(cv_lasso_genes$nzero - target_n_genes))
+coeffs_genes <- coef(cv_lasso_genes, s = cv_lasso_genes$lambda[lambda_idx_genes])
+sig_genes <- rownames(coeffs_genes)[which(coeffs_genes != 0)][-1]
+sig_genes_symbols <- gene_map$SYMBOL[gene_map$ENSEMBL %in% sig_genes]
+cat("Genes selected by LASSO (", length(sig_genes), "):\n", paste(sig_genes_symbols, collapse=", "), "\n")
+
+# Select proteins (target ~6)
+target_n_proteins <- 6
+cv_lasso_prot <- cv.glmnet(as.matrix(X_prot_final), y_outcome_numeric, family = "binomial", alpha = 1, type.measure = "auc")
+lambda_idx_prot <- which.min(abs(cv_lasso_prot$nzero - target_n_proteins))
+coeffs_prot <- coef(cv_lasso_prot, s = cv_lasso_prot$lambda[lambda_idx_prot])
+sig_proteins <- rownames(coeffs_prot)[which(coeffs_prot != 0)][-1]
+cat("Proteins selected by LASSO (", length(sig_proteins), "):\n", paste(sig_proteins, collapse=", "), "\n\n")
+
+
+# -- Module 3.3: Evaluate Model Performance using Repeated Cross-Validation
+cat("--- Module 3.3: Starting 10-time repeated 10-fold cross-validation ---\n")
+
+# Prepare data frames for modeling
+data_list <- list(
+  Clinical = data.frame(outcome = y_outcome_numeric, X_clinical_final[, sig_clinical, drop = FALSE]),
+  Genes = data.frame(outcome = y_outcome_numeric, X_genes_final[, sig_genes, drop = FALSE]),
+  Proteins = data.frame(outcome = y_outcome_numeric, X_prot_final[, sig_proteins, drop = FALSE]),
+  `Clinical+Genes` = cbind(data_clinical, X_genes_final[, sig_genes, drop = FALSE]),
+  `Clinical+Proteins` = cbind(data_clinical, X_prot_final[, sig_proteins, drop = FALSE]),
+  All = cbind(data_clinical, X_genes_final[, sig_genes, drop = FALSE], X_prot_final[, sig_proteins, drop = FALSE])
+)
+
+# Set up cross-validation folds
+set.seed(123)
+cv_folds <- createMultiFolds(y_outcome_numeric, k = 10, times = 10)
+all_results <- list()
+auc_values <- list()
+
+# Cross-validation loop
+for (model_name in names(data_list)) {
+  cat(paste("Evaluating:", model_name, "model...\n"))
+  all_results[[model_name]] <- data.frame(pred = numeric(), obs = numeric())
+  auc_values[[model_name]] <- numeric()
+
+  for(i in 1:length(cv_folds)) {
+    train_data <- data_list[[model_name]][cv_folds[[i]], ]
+    test_data <- data_list[[model_name]][-cv_folds[[i]], ]
+
+    model <- glm(outcome ~ ., data = train_data, family = "binomial")
+    predictions <- predict(model, newdata = test_data, type = "response")
+
+    all_results[[model_name]] <- rbind(all_results[[model_name]], data.frame(pred = predictions, obs = test_data$outcome))
+
+    if(length(unique(test_data$outcome)) == 2) {
+      roc_obj <- roc(response = factor(test_data$outcome), predictor = predictions, levels = c(0, 1), direction = "<", quiet = TRUE)
+      auc_values[[model_name]] <- c(auc_values[[model_name]], auc(roc_obj))
+    }
+  }
+}
+cat("--- Cross-validation complete ---\n\n")
+
+
+# -- Module 3.4: Summarize and Visualize Cross-Validation Results
+cat("--- Module 3.4: Summarizing results and creating ROC plot ---\n")
+
+pdf(file.path(output_dir, "CV_Model_Comparison_ROC_Final.pdf"), width = 10, height = 9)
+
+# Use a publication-standard, colorblind-friendly palette
+colors <- c(Clinical = "#0072B2", Genes = "#D55E00", Proteins = "#009E73",
+            `Clinical+Genes` = "#F0E442", `Clinical+Proteins` = "#CC79A7", All = "#000000")
+
+# Initialize plot
+plot(1, 1, type="n", xlim=c(1,0), ylim=c(0,1), xlab="Specificity", ylab="Sensitivity",
+     main="Cross-Validated ROC Curve Comparison (Logistic Regression)")
+legend_text <- c()
+
+# Loop to plot ROC curves and prepare the legend
+for (model_name in names(all_results)) {
+  final_roc <- roc(response = factor(all_results[[model_name]]$obs), predictor = all_results[[model_name]]$pred,
+                   levels = c(0, 1), direction = "<", quiet = TRUE)
+  plot(final_roc, add=TRUE, col=colors[model_name], lwd=2.5)
+
+  mean_auc <- mean(auc_values[[model_name]])
+  ci <- ci.auc(auc_values[[model_name]])
+
+  legend_text <- c(legend_text,
+                   paste0(model_name, ": AUC = ", round(mean_auc, 3),
+                          " (", round(ci[1], 3), "-", round(ci[3], 3), ")"))
+}
+
+# Add legend
+legend("bottomright", legend = legend_text, col = colors, lwd = 2.5, cex = 0.9,
+       title = "Model: Mean AUC (95% CI)")
+
+dev.off()
+cat("Plotting complete! Please check the file 'CV_Model_Comparison_ROC_Final.pdf'\n")
+
+# Print final statistical comparison results
+cat("\n--- Model Performance Statistical Comparison (DeLong's test) ---\n")
+roc_all <- roc(factor(all_results$All$obs), all_results$All$pred, levels=c(0,1), direction = "<", quiet = TRUE)
+roc_clinical <- roc(factor(all_results$Clinical$obs), all_results$Clinical$pred, levels=c(0,1), direction = "<", quiet = TRUE)
+roc_clin_prot <- roc(factor(all_results$`Clinical+Proteins`$obs), all_results$`Clinical+Proteins`$pred, levels=c(0,1), direction = "<", quiet = TRUE)
+
+cat("\n'All' vs 'Clinical':\n")
+print(roc.test(roc_all, roc_clinical))
+
+cat("\n'Clinical+Proteins' vs 'Clinical':\n")
+print(roc.test(roc_clin_prot, roc_clinical))
+
+cat("\n***** All analysis workflows are complete *****\n")
