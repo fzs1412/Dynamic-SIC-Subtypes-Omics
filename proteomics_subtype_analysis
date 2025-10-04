@@ -1,0 +1,230 @@
+# ==============================================================================
+# SCRIPT: 02_proteomics_subtype_analysis.R
+#
+# PURPOSE:
+# This script performs an advanced analysis of Olink proteomics data. It
+# identifies differentially expressed proteins between SIC clinical subtypes,
+# validates pathways identified in transcriptomics, constructs a protein-protein
+# interaction (PPI) network, and discovers potential protein biomarkers.
+#
+# INPUTS:
+# - olink_data_path: Path to the Olink long-format data CSV.
+# - sample_info_path: Path to the sample mapping information Excel file.
+# - coldata_path: Path to the clinical data CSV file.
+#
+# OUTPUTS:
+# - A folder named 'results_olink' containing:
+#   - Figure_A_Pathway_Validation_Heatmap.pdf
+#   - Figure_B_PPI_Network.pdf
+#   - Figure_C_Top6_Biomarker_Boxplots.pdf
+#
+# ==============================================================================
+
+# --- 0. Setup and Package Loading ---
+
+# -- Ensure all required packages are loaded
+required_packages <- c("dplyr", "readxl", "tidyr", "tibble", "data.table",
+                       "limma", "ggplot2", "pheatmap", "EnhancedVolcano", "STRINGdb")
+for (pkg in required_packages) {
+  # For Bioconductor packages, use BiocManager
+  if (pkg %in% c("limma", "EnhancedVolcano", "STRINGdb") && !requireNamespace(pkg, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(pkg)
+  } else if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+
+# --- 1. Data Loading and Preparation ---
+
+# -- Define file paths (USER: PLEASE UPDATE THESE PATHS)
+olink_data_path <- "D:/OneDrive/R/01sepsis/OMIX006238-01.csv"
+sample_info_path <- "D:/OneDrive/R/01sepsis/Sample_Info.xlsxOLINK.xlsx"
+coldata_path <- "d:/OneDrive/R/25SXFX/25SIC/guiji_coldata394.csv"
+output_dir <- "./results_olink"
+
+
+# -- Load Olink long-format data (NPX values)
+olink_long_data <- read.delim(olink_data_path, sep=";", stringsAsFactors = FALSE)
+cat("Successfully loaded Olink data: ", nrow(olink_long_data), "rows\n")
+
+# -- Load sample information mapping file
+sample_info <- read_excel(sample_info_path)
+cat("Successfully loaded sample map: ", nrow(sample_info), "rows\n")
+
+# -- Preprocess and merge data
+olink_long_data$SampleID <- trimws(as.character(olink_long_data$SampleID))
+sample_info$Sample <- trimws(as.character(sample_info$Sample))
+olink_mapped <- inner_join(olink_long_data, sample_info, by = c("SampleID" = "Sample"))
+cat("[Checkpoint 1]: Successfully matched", nrow(olink_mapped), "rows of data.\n")
+
+# -- Reshape data from long to wide format
+olink_data_wide <- olink_mapped %>%
+  dplyr::select(Assay, SampleID.y, NPX) %>%
+  dplyr::filter(!is.na(SampleID.y) & !is.na(Assay) & !is.na(NPX)) %>%
+  dplyr::group_by(Assay, SampleID.y) %>%
+  dplyr::summarise(NPX = mean(NPX, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = SampleID.y, values_from = NPX) %>%
+  tibble::column_to_rownames("Assay")
+
+# -- Prepare clinical data for analysis cohort
+# Focus on "Persistently Severe" (Class 2) vs. "High-risk Resolving" (Class 4)
+coldata_raw <- fread(coldata_path) %>%
+  filter(class == 2 | class == 4) %>%
+  # Set "High-risk Resolving" (Class 4) as the reference group
+  mutate(class = factor(class,
+                        levels = c("4", "2"),
+                        labels = c("High-risk Resolving", "Persistently Severe"))) %>%
+  column_to_rownames("SampleName")
+
+# -- Align proteomics and clinical data
+# Keep only Day 1 samples for baseline comparison
+day1_samples_olink <- colnames(olink_data_wide)[!grepl("d3$|d5$", colnames(olink_data_wide))]
+olink_data_d1 <- olink_data_wide[, day1_samples_olink]
+
+common_samples_prot <- intersect(colnames(olink_data_d1), rownames(coldata_raw))
+prot_matrix_final <- olink_data_d1[, common_samples_prot]
+coldata_prot_final <- coldata_raw[common_samples_prot, ]
+
+# -- Final consistency check
+stopifnot(all(colnames(prot_matrix_final) == rownames(coldata_prot_final)))
+cat("--- Data preparation complete. Comparing 2 groups based on correct mapping.\n")
+cat("   Baseline Group: 'High-risk Resolving' (Class 4, n =", sum(coldata_prot_final$class == "High-risk Resolving"), ")\n")
+cat("   Comparison Group: 'Persistently Severe' (Class 2, n =", sum(coldata_prot_final$class == "Persistently Severe"), ")\n\n")
+
+
+# --- 2. Differential Protein Expression Analysis (limma) ---
+cat("--- Section 2: Performing differential expression analysis ---\n")
+
+# -- Create the design matrix; 'High-risk Resolving' is the reference
+design <- model.matrix(~ class, data = coldata_prot_final)
+cat("Design matrix columns:", colnames(design), "\n")
+
+# -- Fit linear model and perform Bayesian statistical test
+fit <- lmFit(prot_matrix_final, design)
+fit2 <- eBayes(fit)
+
+# -- Extract full differential expression results
+# Positive logFC = higher expression in the 'Persistently Severe' group
+coeff_name <- "classPersistently Severe"
+full_results <- topTable(fit2, coef = coeff_name, number = Inf, sort.by = "P") %>%
+  rownames_to_column("Protein")
+
+cat("--- Differential analysis complete. Top protein:", full_results$Protein[1],
+    "(logFC =", round(full_results$logFC[1], 2),
+    ", P.Value =", format.pval(full_results$P.Value[1], digits = 2), ")\n\n")
+
+
+# --- 3. Validation of Key Transcriptomic Pathways ---
+cat("--- Section 3: Validating key pathways from transcriptomics ---\n")
+
+# -- Define key pathways and proteins for validation
+pathway_protein_map <- list(
+  `NETosis` = c("MPO", "ELANE"),
+  `Complement_Coagulation` = c("C3", "SERPINE1", "F3", "VWF"),
+  `Cell_Cycle_Proliferation` = c("MKI67", "PCNA", "CDK1"),
+  `Efferocytosis_Immune_Remodeling` = c("GAS6", "MERTK", "IFNG", "IL4", "IL17A"),
+  `Key_Validation_Genes` = c("VSIG4", "ITGB3")
+)
+
+# -- Filter for the differential expression results of these target proteins
+validation_proteins <- unlist(pathway_protein_map)
+validation_results <- full_results %>% filter(Protein %in% validation_proteins)
+
+# -- Visualize validation results with a heatmap
+if (nrow(validation_results) > 0) {
+  heatmap_matrix <- validation_results %>%
+    dplyr::select(Protein, logFC, P.Value) %>%
+    mutate(`-log10(P.Value)` = -log10(P.Value)) %>%
+    dplyr::select(Protein, logFC, `-log10(P.Value)`) %>%
+    column_to_rownames("Protein")
+
+  p_heatmap <- pheatmap(
+    heatmap_matrix,
+    main = "Protein-Level Validation of Key Pathways\n('Persistently Severe' vs 'High-risk Resolving')",
+    cluster_cols = FALSE,
+    fontsize_row = 10,
+    angle_col = 0,
+    display_numbers = TRUE,
+    number_format = "%.2f",
+    color = colorRampPalette(c("navy", "white", "firebrick3"))(50)
+  )
+
+  dir.create(output_dir, showWarnings = FALSE)
+  pdf(file.path(output_dir, "Figure_A_Pathway_Validation_Heatmap.pdf"), width = 8, height = 6)
+  print(p_heatmap)
+  dev.off()
+  cat("--- Pathway validation heatmap saved successfully. ---\n\n")
+} else {
+  cat("--- WARNING: No proteins from the validation list were found. ---\n\n")
+}
+
+
+# --- 4. Protein-Protein Interaction (PPI) Network Analysis ---
+cat("--- Section 4: Constructing PPI network to reveal core mechanisms ---\n")
+
+# -- Filter candidate proteins for network analysis (P.Value < 0.1 to capture more interactions)
+network_candidates <- full_results %>% filter(P.Value < 0.1)
+
+if (nrow(network_candidates) > 3) {
+  string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400) # Medium confidence
+  mapped_proteins <- string_db$map(network_candidates, "Protein", removeUnmappedRows = TRUE)
+
+  # Add color to nodes: Red for up-regulated in 'Persistently Severe', Blue for down-regulated
+  plot_payload <- mapped_proteins %>%
+    mutate(color = ifelse(logFC > 0, "#B2182B", "#2166AC"))
+
+  # Plot and save the network graph
+  pdf(file.path(output_dir, "Figure_B_PPI_Network.pdf"), width = 10, height = 10)
+  string_db$plot_network(mapped_proteins$STRING_id, payload_id = string_db$post_payload(plot_payload$STRING_id, col=plot_payload$color))
+  title("PPI Network of Differentially Expressed Proteins")
+  dev.off()
+
+  cat("--- PPI network graph saved. Red nodes are upregulated in 'Persistently Severe' group. ---\n\n")
+} else {
+  cat("--- WARNING: Not enough significant proteins (P<0.1) to build a meaningful network. Skipped. ---\n\n")
+}
+
+
+# --- 5. Exploratory Biomarker Discovery ---
+cat("--- Section 5: Visualizing top candidate protein biomarkers ---\n")
+
+# -- Extract top 6 significantly different proteins as candidate biomarkers
+top_6_candidates <- head(full_results, 6)
+
+# -- Prepare data for plotting
+plot_data <- prot_matrix_final[top_6_candidates$Protein, ] %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(Subtype = coldata_prot_final$class) %>%
+  pivot_longer(-Subtype, names_to = "Protein", values_to = "NPX")
+
+# Keep protein order consistent with significance
+plot_data$Protein <- factor(plot_data$Protein, levels = top_6_candidates$Protein)
+
+# -- Create and save boxplots
+p_boxplots <- ggplot(plot_data, aes(x = Subtype, y = NPX, fill = Subtype)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+  facet_wrap(~ Protein, scales = "free_y") +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Top 6 Differentially Expressed Protein Biomarkers",
+    subtitle = "'Persistently Severe' vs. 'High-risk Resolving'",
+    x = "SIC Clinical Subtype",
+    y = "Normalized Protein Expression (NPX)"
+  ) +
+  scale_fill_manual(values = c("High-risk Resolving" = "#0072B2", "Persistently Severe" = "#D55E00")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        strip.background = element_rect(fill = "grey90"),
+        strip.text = element_text(face = "bold"))
+
+ggsave(file.path(output_dir, "Figure_C_Top6_Biomarker_Boxplots.pdf"), plot = p_boxplots, width = 12, height = 8, device = "pdf")
+cat("--- Boxplots for top 6 biomarker candidates saved. ---\n\n")
+
+
+cat("***** Proteomics analysis workflow is complete. *****\n")
+cat("***** All results are saved in the 'results_olink' folder. *****\n")
